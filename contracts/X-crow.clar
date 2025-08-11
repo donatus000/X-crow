@@ -1,7 +1,10 @@
+;; Enhanced X-crow Escrow Contract with Dynamic Fees and Time-Locked Multi-Sig
+
 ;; Rate Limiting Map
 (define-map last-action principal uint)
 (define-constant min-blocks-between-actions u10)
 
+;; Core Contract State
 (define-data-var client (optional principal) none)
 (define-data-var freelancer (optional principal) none)
 (define-data-var arbiter (optional principal) none)
@@ -16,10 +19,42 @@
 ;; Platform Settings
 (define-map allowed-signers principal bool)
 (define-data-var required-signatures uint u2)
-(define-data-var platform-fee uint u25) ;; 2.5%
+(define-data-var platform-fee uint u25) ;; 2.5% (fallback)
 (define-constant fee-denominator u1000)
 (define-data-var contract-locked bool false)
 (define-data-var contract-owner principal tx-sender)
+
+;; Dynamic Fee Structure
+(define-map user-volume principal uint)
+(define-map user-reputation principal {
+  total-contracts: uint,
+  successful-contracts: uint,
+  total-volume: uint,
+  average-rating: uint,
+  dispute-count: uint,
+  last-updated: uint
+})
+
+(define-map fee-tiers uint { min-volume: uint, max-volume: uint, fee-rate: uint })
+(define-data-var base-fee uint u25) ;; 2.5%
+(define-data-var reputation-discount uint u5) ;; 0.5% discount for high reputation
+(define-data-var volume-discount-threshold uint u1000000) ;; 1M STX threshold
+
+;; Time-Locked Multi-Signature System
+(define-map pending-transactions uint {
+  transaction-type: (string-ascii 50),
+  target-amount: uint,
+  target-address: principal,
+  signatures-required: uint,
+  signatures-received: uint,
+  created-at: uint,
+  execution-delay: uint,
+  executed: bool
+})
+
+(define-map transaction-signatures { tx-id: uint, signer: principal } bool)
+(define-data-var transaction-counter uint u0)
+(define-constant large-amount-threshold u1000000) ;; 1M STX
 
 ;; Enhanced Error Constants
 (define-constant err-deposit-already-made u100)
@@ -48,8 +83,37 @@
 (define-constant err-same-address u160)
 (define-constant err-zero-amount u161)
 (define-constant err-insufficient-balance u162)
+(define-constant err-transaction-not-found u170)
+(define-constant err-transaction-executed u171)
+(define-constant err-insufficient-signatures u172)
+(define-constant err-execution-delay-not-met u173)
+(define-constant err-already-signed u174)
 
-;; Fee Calculation Function
+;; Initialize fee tiers
+(map-set fee-tiers u1 { min-volume: u0, max-volume: u100000, fee-rate: u25 })
+(map-set fee-tiers u2 { min-volume: u100001, max-volume: u500000, fee-rate: u20 })
+(map-set fee-tiers u3 { min-volume: u500001, max-volume: u1000000, fee-rate: u15 })
+(map-set fee-tiers u4 { min-volume: u1000001, max-volume: u999999999, fee-rate: u10 })
+
+;; Dynamic Fee Calculation Functions
+(define-private (get-fee-rate-for-volume (volume uint))
+  (if (<= volume u100000) u25
+    (if (<= volume u500000) u20
+      (if (<= volume u1000000) u15 u10))))
+
+(define-private (calculate-dynamic-fee (user principal) (payment-amount uint))
+  (let (
+    (user-vol (default-to u0 (map-get? user-volume user)))
+    (base-rate (get-fee-rate-for-volume user-vol))
+    (reputation-bonus (if (> user-vol (var-get volume-discount-threshold)) (var-get reputation-discount) u0))
+    (final-rate (if (>= base-rate reputation-bonus) (- base-rate reputation-bonus) u1)))
+    (/ (* payment-amount final-rate) fee-denominator)))
+
+(define-private (update-user-volume (user principal) (transaction-amount uint))
+  (let ((current-vol (default-to u0 (map-get? user-volume user))))
+    (map-set user-volume user (+ current-vol transaction-amount))))
+
+;; Legacy fee calculation for backward compatibility
 (define-private (calculate-platform-fee (payment uint))
     (/ (* payment (var-get platform-fee)) fee-denominator))
 
@@ -103,6 +167,54 @@
             (asserts! (validate-principal addr) (err err-invalid-principal))
             (ok addr))))
 
+;; Time-Locked Multi-Signature Functions
+(define-public (propose-large-withdrawal (withdrawal-amount uint) (recipient principal))
+  (let ((tx-id (+ (var-get transaction-counter) u1)))
+    (begin
+      (asserts! (>= withdrawal-amount large-amount-threshold) (err err-invalid-amount))
+      (try! (validate-trusted-principal tx-sender (var-get client)))
+      (asserts! (validate-principal recipient) (err err-invalid-principal))
+      
+      (map-set pending-transactions tx-id {
+        transaction-type: "withdrawal",
+        target-amount: withdrawal-amount,
+        target-address: recipient,
+        signatures-required: u3,
+        signatures-received: u1,
+        created-at: stacks-block-height,
+        execution-delay: u1440, ;; 24 hour delay
+        executed: false
+      })
+      
+      (map-set transaction-signatures { tx-id: tx-id, signer: tx-sender } true)
+      (var-set transaction-counter tx-id)
+      (ok tx-id))))
+
+(define-public (sign-pending-transaction (tx-id uint))
+  (let ((tx-info (unwrap! (map-get? pending-transactions tx-id) (err err-transaction-not-found))))
+    (begin
+      (asserts! (default-to false (map-get? allowed-signers tx-sender)) (err err-unauthorized-signer))
+      (asserts! (not (default-to false (map-get? transaction-signatures { tx-id: tx-id, signer: tx-sender }))) (err err-already-signed))
+      (asserts! (not (get executed tx-info)) (err err-transaction-executed))
+      
+      (map-set transaction-signatures { tx-id: tx-id, signer: tx-sender } true)
+      (map-set pending-transactions tx-id (merge tx-info { 
+        signatures-received: (+ (get signatures-received tx-info) u1) 
+      }))
+      (ok "Transaction signed"))))
+
+(define-public (execute-pending-transaction (tx-id uint))
+  (let ((tx-info (unwrap! (map-get? pending-transactions tx-id) (err err-transaction-not-found))))
+    (begin
+      (asserts! (>= (get signatures-received tx-info) (get signatures-required tx-info)) (err err-insufficient-signatures))
+      (asserts! (> stacks-block-height (+ (get created-at tx-info) (get execution-delay tx-info))) (err err-execution-delay-not-met))
+      (asserts! (not (get executed tx-info)) (err err-transaction-executed))
+      
+      ;; Execute the transaction
+      (try! (stx-transfer? (get target-amount tx-info) (as-contract tx-sender) (get target-address tx-info)))
+      (map-set pending-transactions tx-id (merge tx-info { executed: true }))
+      (ok "Transaction executed"))))
+
 ;; Read-only Functions
 (define-read-only (Xcrow-status) 
     (ok {
@@ -136,6 +248,18 @@
 (define-read-only (get-milestone (milestone-id uint))
     (map-get? milestones milestone-id))
 
+(define-read-only (get-user-volume (user principal))
+  (map-get? user-volume user))
+
+(define-read-only (get-user-reputation (user principal))
+  (map-get? user-reputation user))
+
+(define-read-only (get-pending-transaction (tx-id uint))
+  (map-get? pending-transactions tx-id))
+
+(define-read-only (calculate-fee-for-user (user principal) (transaction-amount uint))
+  (ok (calculate-dynamic-fee user transaction-amount)))
+
 ;; Enhanced Public Functions
 (define-public (deposit (freelancer-addr principal) (deposit-amount uint))
     (begin
@@ -154,6 +278,8 @@
                 (var-set amount deposit-amount)
                 (var-set deposit-made true)
                 (var-set deposit-block stacks-block-height)
+                ;; Update user volume for dynamic fee calculation
+                (update-user-volume tx-sender deposit-amount)
                 (unlock-contract)
                 (ok "Deposit made successfully"))
             error (begin
@@ -198,8 +324,10 @@
         (client-ok (var-get client-approved))
         (freelancer-ok (var-get freelancer-approved))
         (freelancer-addr (try! (get-validated-principal (var-get freelancer))))
+        (client-addr (try! (get-validated-principal (var-get client))))
         (amt (var-get amount))
-        (platform-fee-amt (calculate-platform-fee amt))
+        ;; Use dynamic fee calculation
+        (platform-fee-amt (calculate-dynamic-fee client-addr amt))
         (net-amount (- amt platform-fee-amt)))
     (begin
         (try! (check-rate-limit))
@@ -208,39 +336,56 @@
         (asserts! (var-get deposit-made) (err err-no-deposit))
         (asserts! (not (var-get dispute-raised)) (err err-no-dispute))
         
-        ;; Transfer net amount to freelancer (already validated)
-        (try! (stx-transfer? net-amount (as-contract tx-sender) freelancer-addr))
-        
-        ;; Transfer platform fee to contract owner (if any)
-        (if (> platform-fee-amt u0)
-            (try! (stx-transfer? platform-fee-amt (as-contract tx-sender) (var-get contract-owner)))
-            true)
-        
-        ;; Reset state
-        (var-set deposit-made false)
-        (var-set client-approved false)
-        (var-set freelancer-approved false)
-        (var-set amount u0)
-        (unlock-contract)
-        (ok "Payment released to freelancer"))))
+        ;; For large amounts, require time-locked multi-sig
+        (if (>= amt large-amount-threshold)
+            (begin
+                ;; Large amount - create pending transaction instead
+                (let ((tx-id (+ (var-get transaction-counter) u1)))
+                    (map-set pending-transactions tx-id {
+                        transaction-type: "large-withdrawal",
+                        target-amount: net-amount,
+                        target-address: freelancer-addr,
+                        signatures-required: u2,
+                        signatures-received: u1,
+                        created-at: stacks-block-height,
+                        execution-delay: u144, ;; 1 day delay for large amounts
+                        executed: false
+                    })
+                    (var-set transaction-counter tx-id)
+                    (unlock-contract)
+                    (ok "Large withdrawal requires additional approval")))
+            ;; Normal amount - process immediately
+            (begin
+                ;; Transfer net amount to freelancer
+                (try! (stx-transfer? net-amount (as-contract tx-sender) freelancer-addr))
+                
+                ;; Transfer platform fee to contract owner (if any)
+                (if (> platform-fee-amt u0)
+                    (try! (stx-transfer? platform-fee-amt (as-contract tx-sender) (var-get contract-owner)))
+                    true)
+                
+                ;; Reset state
+                (var-set deposit-made false)
+                (var-set client-approved false)
+                (var-set freelancer-approved false)
+                (var-set amount u0)
+                (unlock-contract)
+                (ok "Payment released to freelancer"))))))
 
 (define-public (refund)
     (let (
         (current-block (var-get deposit-block))
         (freelancer-ok (var-get freelancer-approved))
         (amt (var-get amount))
-        ;; FIXED: Validate client address immediately after extraction
         (client-addr (try! (get-validated-principal (var-get client)))))
     (begin
         (try! (check-rate-limit))
         (try! (check-reentrancy))
-        ;; Validate that tx-sender is the client
         (try! (validate-trusted-principal tx-sender (var-get client)))
         (asserts! (not freelancer-ok) (err err-freelancer-already-approved))
         (asserts! (> (- stacks-block-height current-block) timeout) (err err-timeout-not-reached))
         (asserts! (var-get deposit-made) (err err-no-deposit))
         
-        ;; FIXED: client-addr is now validated before use
         (try! (stx-transfer? amt (as-contract tx-sender) client-addr))
         
         (var-set deposit-made false)
@@ -342,6 +487,22 @@
         (var-set freelancer-approved false)
         (unlock-contract)
         (ok "Dispute resolved successfully"))))
+
+;; Fee Management Functions
+(define-public (update-fee-tier (tier-id uint) (min-vol uint) (max-vol uint) (fee-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) (err err-unauthorized-client))
+        (asserts! (<= fee-rate u100) (err err-invalid-amount)) ;; Max 10% fee
+        (asserts! (< min-vol max-vol) (err err-invalid-amount))
+        (map-set fee-tiers tier-id { min-volume: min-vol, max-volume: max-vol, fee-rate: fee-rate })
+        (ok "Fee tier updated")))
+
+(define-public (set-reputation-discount (discount uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) (err err-unauthorized-client))
+        (asserts! (<= discount u10) (err err-invalid-amount)) ;; Max 1% discount
+        (var-set reputation-discount discount)
+        (ok "Reputation discount updated")))
 
 ;; Emergency Functions (only contract owner)
 (define-public (emergency-pause)
