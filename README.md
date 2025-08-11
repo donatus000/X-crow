@@ -1,144 +1,148 @@
-# X-crow.clar – Freelance Escrow Smart Contract
+# X-crow: Advanced Freelance Escrow Smart Contract
 
-**X-crow.clar** is a Clarity smart contract for secure freelance escrow transactions on the Stacks blockchain. It supports milestone payments, dispute resolution, multi-signature approvals, rate limiting, and platform fees.
-
----
+A secure, feature-rich escrow system for freelance work implemented in Clarity for the Stacks blockchain.
 
 ## Features
 
-- **Escrow Roles:**  
-  - `client`, `freelancer`, and optional `arbiter` for dispute resolution.
-- **Deposit & Approval:**  
-  - Client deposits STX, sets freelancer, and both parties must approve before funds are released.
-- **Milestones:**  
-  - Supports up to 1000 milestones, each with amount, description, deadline, and approval flags.
-- **Dispute Resolution:**  
-  - Either party can raise a dispute; arbiter resolves by selecting a winner.
-- **Multi-signature Support:**  
-  - Client can add/remove signers; signers can approve release.
-- **Rate Limiting & Reentrancy Protection:**  
-  - Prevents spam and reentrancy attacks using block height checks and contract lock.
-- **Platform Fee:**  
-  - 2.5% fee deducted from payments and sent to contract owner.
-- **Emergency Controls:**  
-  - Contract owner can pause/unpause contract operations.
+### Core Functionality
+- **Role-based Access Control**
+  - Client (project owner)
+  - Freelancer (service provider)
+  - Arbiter (dispute resolver)
+  - Contract Owner (platform administrator)
 
----
+### Security & Protection
+- **Multi-signature Support**
+  - Required for large transactions (>1M STX)
+  - Configurable signature requirements
+  - Time-locked execution delays
+- **Rate Limiting**
+  - Prevents spam attacks
+  - Minimum block intervals between actions
+- **Reentrancy Protection**
+  - Contract-level locking mechanism
+  - Secure state transitions
 
-## Usage
+### Economic Model
+- **Dynamic Fee Structure**
+  - Volume-based tiers (2.5% - 1%)
+  - Reputation-based discounts
+  - Customizable fee parameters
+- **Milestone Management**
+  - Support for up to 1000 milestones
+  - Individual amount tracking
+  - Deadline enforcement
+  - Dual-party approval system
 
-### 1. Deposit
+## Usage Examples
 
-Client deposits funds and sets freelancer:
+### Basic Escrow Flow
 
-````clarity
-(deposit freelancer-addr deposit-amount)
-````
+```clarity
+;; 1. Client deposits funds
+(deposit freelancer-principal deposit-amount)
 
-### 2. Set Arbiter
+;; 2. Set arbiter (optional)
+(set-arbiter arbiter-principal)
 
-Client sets an arbiter for dispute resolution:
-
-````clarity
-(set-arbiter arbiter-addr)
-````
-
-### 3. Approvals
-
-Client and freelancer approve release of funds:
-
-````clarity
+;; 3. Both parties approve
 (client-approve)
 (freelancer-approve)
-````
 
-### 4. Withdraw
-
-Release funds to freelancer (after both approvals):
-
-````clarity
+;; 4. Release funds
 (withdraw)
-````
+```
 
-### 5. Refund
+### Milestone Management
 
-Client can refund if freelancer hasn’t approved and timeout has passed:
+```clarity
+;; Create milestone
+(add-milestone 
+    milestone-id 
+    amount 
+    "Milestone description" 
+    deadline-block)
 
-````clarity
-(refund)
-````
-
-### 6. Milestones
-
-Add and complete milestones:
-
-````clarity
-(add-milestone milestone-id milestone-amount description deadline)
+;; Mark complete
 (complete-milestone milestone-id)
-````
+```
 
-### 7. Dispute Resolution
+### Dispute Resolution
 
-Raise and resolve disputes:
-
-````clarity
+```clarity
+;; Raise dispute
 (raise-dispute)
-(resolve-dispute winner)
-````
 
-### 8. Multi-signature
+;; Resolve (arbiter only)
+(resolve-dispute winner-principal)
+```
 
-Add/remove signers and sign approval:
+## Contract State Queries
 
-````clarity
-(add-signer signer)
-(remove-signer signer)
-(sign-approval)
-````
+```clarity
+;; Get basic status
+(Xcrow-status)
 
-### 9. Emergency Controls
+;; Get detailed metrics
+(get-detailed-status)
 
-Pause/unpause contract (owner only):
+;; Check milestone
+(get-milestone milestone-id)
 
-````clarity
+;; Get user stats
+(get-user-volume user-principal)
+(get-user-reputation user-principal)
+```
+
+## Security Features
+
+### Rate Limiting
+- 10 blocks minimum between actions
+- Prevents transaction spam
+- Per-address tracking
+
+### Multi-signature Requirements
+- Large transactions (>1M STX)
+- 24-hour execution delay
+- Multiple required signers
+
+### Emergency Controls
+```clarity
+;; Platform owner only
 (emergency-pause)
 (emergency-unpause)
-````
+```
 
----
+## Error Handling
 
-## Read-only Functions
+Comprehensive error codes for:
+- Authentication failures
+- Invalid inputs
+- State violations
+- Rate limiting
+- Insufficient funds
+- Transaction restrictions
 
-- `escrow-status` – Returns current contract state.
-- `get-detailed-status` – Returns contract state and metrics.
-- `get-milestone milestone-id` – Returns milestone details.
+## Development
 
----
+### Prerequisites
+- Clarity CLI
+- Stacks blockchain node
+- Node.js v14+
 
-## Security
+### Testing
+```bash
+clarinet test tests/X-crow_test.ts
+```
 
-- **Input Validation:**  
-  - Checks for valid principals, amounts, deadlines, and roles.
-- **Rate Limiting:**  
-  - Minimum blocks between actions per address.
-- **Reentrancy Protection:**  
-  - Contract lock prevents concurrent actions.
-- **Emergency Pause:**  
-  - Owner can pause contract in emergencies.
-
----
-
-## Error Codes
-
-Contract uses detailed error codes for all failure scenarios (e.g., unauthorized actions, invalid inputs, rate limiting, etc.).
-
----
+### Deployment
+```bash
+clarinet deploy --network mainnet contracts/X-crow.clar
+```
 
 ## License
 
-MIT License (see repository for details).
-
----
+MIT License
 
 ## Author
 
@@ -146,5 +150,14 @@ Donatus David
 
 ---
 
-**Note:**  
-This contract is for educational and demonstration purposes. Review and audit before deploying in production.
+**Warning**: This contract handles real assets. Audit and thorough testing required before production use.
+
+## Contributing
+
+1. Fork the repository
+2. Create feature branch
+3. Commit changes
+4. Push to branch
+5. Create Pull Request
+
+For detailed specifications and integration guides, see Documentation.
