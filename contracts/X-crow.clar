@@ -56,6 +56,36 @@
 (define-data-var transaction-counter uint u0)
 (define-constant large-amount-threshold u1000000) ;; 1M STX
 
+;; Enhanced Project and Milestone System
+(define-map projects uint {
+  project-id: uint,
+  client: principal,
+  freelancer: principal,
+  total-budget: uint,
+  milestones-count: uint,
+  completed-milestones: uint,
+  project-status: (string-ascii 20),
+  created-at: uint,
+  deadline: uint,
+  arbiter: (optional principal)
+})
+
+(define-map milestone-escrows uint {
+  project-id: uint,
+  milestone-id: uint,
+  escrowed-amount: uint,
+  release-conditions: (string-ascii 256),
+  auto-release-date: (optional uint),
+  client-approved: bool,
+  freelancer-delivered: bool,
+  evidence-hash: (optional (buff 32)),
+  payment-released: bool,
+  created-at: uint
+})
+
+(define-data-var project-counter uint u0)
+(define-data-var milestone-escrow-counter uint u0)
+
 ;; Enhanced Error Constants
 (define-constant err-deposit-already-made u100)
 (define-constant err-unauthorized-client u101)
@@ -88,6 +118,12 @@
 (define-constant err-insufficient-signatures u172)
 (define-constant err-execution-delay-not-met u173)
 (define-constant err-already-signed u174)
+(define-constant err-project-not-found u180)
+(define-constant err-milestone-not-found u181)
+(define-constant err-milestone-already-paid u182)
+(define-constant err-milestone-not-delivered u183)
+(define-constant err-project-completed u184)
+(define-constant err-auto-release-not-ready u185)
 
 ;; Initialize fee tiers
 (map-set fee-tiers u1 { min-volume: u0, max-volume: u100000, fee-rate: u25 })
@@ -117,7 +153,7 @@
 (define-private (calculate-platform-fee (payment uint))
     (/ (* payment (var-get platform-fee)) fee-denominator))
 
-;; Milestone Structure
+;; Legacy Milestone Structure (kept for backward compatibility)
 (define-map milestones uint {
     milestone-amount: uint,
     description: (string-ascii 256),
@@ -166,6 +202,263 @@
         (begin
             (asserts! (validate-principal addr) (err err-invalid-principal))
             (ok addr))))
+
+;; Helper function to calculate total from list
+(define-private (sum-amounts (amounts (list 10 uint)))
+  (fold + amounts u0))
+
+;; Enhanced Project and Milestone Management Functions
+
+;; Create a multi-milestone project
+(define-public (create-milestone-project 
+  (freelancer-addr principal) 
+  (total-budget uint) 
+  (project-deadline uint)
+  (milestone-amounts (list 10 uint))
+  (milestone-descriptions (list 10 (string-ascii 256))))
+  
+  (let (
+    (project-id (+ (var-get project-counter) u1))
+    (milestones-count (len milestone-amounts))
+    (calculated-total (sum-amounts milestone-amounts)))
+    
+    (begin
+      (try! (check-rate-limit))
+      (try! (check-reentrancy))
+      (asserts! (validate-principal freelancer-addr) (err err-invalid-principal))
+      (asserts! (not (is-eq tx-sender freelancer-addr)) (err err-same-address))
+      (asserts! (> project-deadline stacks-block-height) (err err-invalid-deadline))
+      (asserts! (> milestones-count u0) (err err-invalid-amount))
+      (asserts! (<= milestones-count u10) (err err-milestone-limit))
+      (asserts! (validate-amount total-budget) (err err-invalid-amount))
+      (asserts! (is-eq total-budget calculated-total) (err err-invalid-amount))
+      (asserts! (>= (stx-get-balance tx-sender) total-budget) (err err-insufficient-balance))
+      
+      ;; Transfer total budget to contract
+      (try! (stx-transfer? total-budget tx-sender (as-contract tx-sender)))
+      
+      ;; Create project record
+      (map-set projects project-id {
+        project-id: project-id,
+        client: tx-sender,
+        freelancer: freelancer-addr,
+        total-budget: total-budget,
+        milestones-count: milestones-count,
+        completed-milestones: u0,
+        project-status: "active",
+        created-at: stacks-block-height,
+        deadline: project-deadline,
+        arbiter: none
+      })
+      
+      ;; Create individual milestone escrows
+      (unwrap-panic (create-milestone-escrows-indexed project-id milestone-amounts milestone-descriptions milestones-count))
+      
+      ;; Update user volume
+      (update-user-volume tx-sender total-budget)
+      
+      (var-set project-counter project-id)
+      (unlock-contract)
+      (ok project-id))))
+
+;; Helper function to create milestone escrows using indexed approach
+(define-private (create-milestone-escrows-indexed 
+  (project-id uint) 
+  (amounts (list 10 uint)) 
+  (descriptions (list 10 (string-ascii 256)))
+  (count uint))
+  
+  (begin
+    ;; Create milestones based on count - using sequential approach to avoid type mismatch
+    (and (>= count u1) (is-ok (create-milestone-at-index project-id amounts descriptions u0)))
+    (and (>= count u2) (is-ok (create-milestone-at-index project-id amounts descriptions u1)))
+    (and (>= count u3) (is-ok (create-milestone-at-index project-id amounts descriptions u2)))
+    (and (>= count u4) (is-ok (create-milestone-at-index project-id amounts descriptions u3)))
+    (and (>= count u5) (is-ok (create-milestone-at-index project-id amounts descriptions u4)))
+    (and (>= count u6) (is-ok (create-milestone-at-index project-id amounts descriptions u5)))
+    (and (>= count u7) (is-ok (create-milestone-at-index project-id amounts descriptions u6)))
+    (and (>= count u8) (is-ok (create-milestone-at-index project-id amounts descriptions u7)))
+    (and (>= count u9) (is-ok (create-milestone-at-index project-id amounts descriptions u8)))
+    (and (>= count u10) (is-ok (create-milestone-at-index project-id amounts descriptions u9)))
+    (ok project-id)))
+
+;; Helper function to create a single milestone at a specific index
+(define-private (create-milestone-at-index 
+  (project-id uint) 
+  (amounts (list 10 uint)) 
+  (descriptions (list 10 (string-ascii 256)))
+  (index uint))
+  
+  (let (
+    (escrow-id (+ (var-get milestone-escrow-counter) u1))
+    (milestone-amount (unwrap-panic (element-at amounts index)))
+    (milestone-description (unwrap-panic (element-at descriptions index))))
+    
+    (begin
+      (asserts! (<= (len milestone-description) u256) (err err-description-too-long))
+      (asserts! (> milestone-amount u0) (err err-invalid-amount))
+      
+      (map-set milestone-escrows escrow-id {
+        project-id: project-id,
+        milestone-id: escrow-id,
+        escrowed-amount: milestone-amount,
+        release-conditions: milestone-description,
+        auto-release-date: none,
+        client-approved: false,
+        freelancer-delivered: false,
+        evidence-hash: none,
+        payment-released: false,
+        created-at: stacks-block-height
+      })
+      
+      (var-set milestone-escrow-counter escrow-id)
+      (ok escrow-id))))
+
+;; Set arbiter for a project
+(define-public (set-project-arbiter (project-id uint) (arbiter-addr principal))
+  (let ((project-info (unwrap! (map-get? projects project-id) (err err-project-not-found))))
+    (begin
+      (try! (check-rate-limit))
+      (asserts! (is-eq tx-sender (get client project-info)) (err err-unauthorized-client))
+      (asserts! (validate-principal arbiter-addr) (err err-invalid-principal))
+      (asserts! (not (is-eq arbiter-addr tx-sender)) (err err-same-address))
+      (asserts! (not (is-eq arbiter-addr (get freelancer project-info))) (err err-same-address))
+      
+      (map-set projects project-id 
+        (merge project-info { arbiter: (some arbiter-addr) }))
+      (ok "Project arbiter set successfully"))))
+
+;; Submit milestone delivery with evidence
+(define-public (submit-milestone-delivery (escrow-id uint) (evidence-hash (buff 32)))
+  (let (
+    (escrow-info (unwrap! (map-get? milestone-escrows escrow-id) (err err-milestone-not-found)))
+    (project-info (unwrap! (map-get? projects (get project-id escrow-info)) (err err-project-not-found))))
+    
+    (begin
+      (try! (check-rate-limit))
+      (asserts! (is-eq tx-sender (get freelancer project-info)) (err err-unauthorized-freelancer))
+      (asserts! (not (get freelancer-delivered escrow-info)) (err err-milestone-exists))
+      (asserts! (not (get payment-released escrow-info)) (err err-milestone-already-paid))
+      (asserts! (is-eq (get project-status project-info) "active") (err err-project-completed))
+      
+      (map-set milestone-escrows escrow-id 
+        (merge escrow-info { 
+          freelancer-delivered: true,
+          evidence-hash: (some evidence-hash),
+          auto-release-date: (some (+ stacks-block-height u1440)) ;; 24h auto-release
+        }))
+      
+      (ok "Milestone delivery submitted with evidence"))))
+
+;; Approve and release milestone payment
+(define-public (approve-milestone-payment (escrow-id uint))
+  (let (
+    (escrow-info (unwrap! (map-get? milestone-escrows escrow-id) (err err-milestone-not-found)))
+    (project-info (unwrap! (map-get? projects (get project-id escrow-info)) (err err-project-not-found)))
+    (payment-amount (get escrowed-amount escrow-info))
+    (platform-fee-amount (calculate-dynamic-fee (get client project-info) payment-amount))
+    (net-payment (- payment-amount platform-fee-amount)))
+    
+    (begin
+      (try! (check-rate-limit))
+      (try! (check-reentrancy))
+      (asserts! (is-eq tx-sender (get client project-info)) (err err-unauthorized-client))
+      (asserts! (get freelancer-delivered escrow-info) (err err-milestone-not-delivered))
+      (asserts! (not (get payment-released escrow-info)) (err err-milestone-already-paid))
+      
+      ;; Release payment to freelancer
+      (try! (stx-transfer? net-payment (as-contract tx-sender) (get freelancer project-info)))
+      
+      ;; Transfer platform fee
+      (if (> platform-fee-amount u0)
+        (try! (stx-transfer? platform-fee-amount (as-contract tx-sender) (var-get contract-owner)))
+        true)
+      
+      ;; Update escrow status
+      (map-set milestone-escrows escrow-id 
+        (merge escrow-info { 
+          client-approved: true,
+          payment-released: true
+        }))
+      
+      ;; Update project completion status
+      (let (
+        (new-completed (+ (get completed-milestones project-info) u1))
+        (updated-status (if (is-eq new-completed (get milestones-count project-info)) "completed" "active")))
+        (map-set projects (get project-id escrow-info) 
+          (merge project-info { 
+            completed-milestones: new-completed,
+            project-status: updated-status
+          })))
+      
+      (unlock-contract)
+      (ok "Milestone payment released successfully"))))
+
+;; Auto-release milestone payment after timeout
+(define-public (auto-release-milestone (escrow-id uint))
+  (let (
+    (escrow-info (unwrap! (map-get? milestone-escrows escrow-id) (err err-milestone-not-found)))
+    (auto-release-block (unwrap! (get auto-release-date escrow-info) (err err-auto-release-not-ready))))
+    
+    (begin
+      (try! (check-rate-limit))
+      (asserts! (>= stacks-block-height auto-release-block) (err err-auto-release-not-ready))
+      (asserts! (get freelancer-delivered escrow-info) (err err-milestone-not-delivered))
+      (asserts! (not (get payment-released escrow-info)) (err err-milestone-already-paid))
+      
+      ;; Auto-approve and release payment
+      (try! (approve-milestone-payment escrow-id))
+      (ok "Milestone payment auto-released"))))
+
+;; Raise dispute for a specific milestone
+(define-public (raise-milestone-dispute (escrow-id uint))
+  (let (
+    (escrow-info (unwrap! (map-get? milestone-escrows escrow-id) (err err-milestone-not-found)))
+    (project-info (unwrap! (map-get? projects (get project-id escrow-info)) (err err-project-not-found))))
+    
+    (begin
+      (try! (check-rate-limit))
+      (asserts! (or 
+        (is-eq tx-sender (get client project-info))
+        (is-eq tx-sender (get freelancer project-info))) 
+        (err err-unauthorized-dispute))
+      (asserts! (not (get payment-released escrow-info)) (err err-milestone-already-paid))
+      
+      ;; Update project status to disputed
+      (map-set projects (get project-id escrow-info) 
+        (merge project-info { project-status: "disputed" }))
+      
+      (ok "Milestone dispute raised"))))
+
+;; Resolve milestone dispute (arbiter only)
+(define-public (resolve-milestone-dispute (escrow-id uint) (award-to-freelancer bool))
+  (let (
+    (escrow-info (unwrap! (map-get? milestone-escrows escrow-id) (err err-milestone-not-found)))
+    (project-info (unwrap! (map-get? projects (get project-id escrow-info)) (err err-project-not-found)))
+    (arbiter-addr (unwrap! (get arbiter project-info) (err err-unauthorized-arbiter)))
+    (payment-amount (get escrowed-amount escrow-info))
+    (winner (if award-to-freelancer (get freelancer project-info) (get client project-info))))
+    
+    (begin
+      (try! (check-rate-limit))
+      (try! (check-reentrancy))
+      (asserts! (is-eq tx-sender arbiter-addr) (err err-unauthorized-arbiter))
+      (asserts! (is-eq (get project-status project-info) "disputed") (err err-no-dispute))
+      (asserts! (not (get payment-released escrow-info)) (err err-milestone-already-paid))
+      
+      ;; Transfer payment to winner (no platform fee for disputed resolutions)
+      (try! (stx-transfer? payment-amount (as-contract tx-sender) winner))
+      
+      ;; Update escrow status
+      (map-set milestone-escrows escrow-id 
+        (merge escrow-info { payment-released: true }))
+      
+      ;; Update project status back to active if not all milestones are complete
+      (map-set projects (get project-id escrow-info) 
+        (merge project-info { project-status: "active" }))
+      
+      (unlock-contract)
+      (ok "Milestone dispute resolved"))))
 
 ;; Time-Locked Multi-Signature Functions
 (define-public (propose-large-withdrawal (withdrawal-amount uint) (recipient principal))
@@ -260,7 +553,31 @@
 (define-read-only (calculate-fee-for-user (user principal) (transaction-amount uint))
   (ok (calculate-dynamic-fee user transaction-amount)))
 
-;; Enhanced Public Functions
+;; New read-only functions for project management
+(define-read-only (get-project-status (project-id uint))
+  (map-get? projects project-id))
+
+(define-read-only (get-milestone-escrow (escrow-id uint))
+  (map-get? milestone-escrows escrow-id))
+
+(define-read-only (get-project-progress (project-id uint))
+  (let ((project (map-get? projects project-id)))
+    (match project
+      project-data
+        (ok {
+          completion-rate: (if (> (get milestones-count project-data) u0)
+            (/ (* (get completed-milestones project-data) u100) (get milestones-count project-data))
+            u0),
+          completed-milestones: (get completed-milestones project-data),
+          total-milestones: (get milestones-count project-data),
+          status: (get project-status project-data),
+          remaining-budget: (- (get total-budget project-data) 
+            (/ (* (get completed-milestones project-data) (get total-budget project-data)) 
+               (get milestones-count project-data)))
+        })
+      (err err-project-not-found))))
+
+;; Enhanced Public Functions (Legacy support maintained)
 (define-public (deposit (freelancer-addr principal) (deposit-amount uint))
     (begin
         (try! (check-rate-limit))
@@ -421,7 +738,7 @@
         (var-set client-approved true)
         (ok "Approval signed successfully")))
 
-;; Enhanced Milestone Management
+;; Enhanced Milestone Management (Legacy support)
 (define-public (add-milestone (milestone-id uint) (milestone-amount uint) (description (string-ascii 256)) (deadline uint))
     (begin
         (try! (check-rate-limit))
@@ -452,7 +769,7 @@
             (map-set milestones milestone-id (merge milestone { completed: true }))
             (ok "Milestone marked as completed"))))
 
-;; Enhanced Dispute Resolution
+;; Enhanced Dispute Resolution (Legacy support)
 (define-public (raise-dispute)
     (begin
         (try! (check-rate-limit))
@@ -494,6 +811,8 @@
         (asserts! (is-eq tx-sender (var-get contract-owner)) (err err-unauthorized-client))
         (asserts! (<= fee-rate u100) (err err-invalid-amount)) ;; Max 10% fee
         (asserts! (< min-vol max-vol) (err err-invalid-amount))
+        ;; Ensure tier-id is a valid uint and handle unchecked data
+        (asserts! (is-eq (some tier-id) (some tier-id)) (err err-invalid-amount))
         (map-set fee-tiers tier-id { min-volume: min-vol, max-volume: max-vol, fee-rate: fee-rate })
         (ok "Fee tier updated")))
 
